@@ -219,10 +219,10 @@ class LicensingAndBillingTest extends TestCase
         $token = $admin->createToken('seat-limit-test')->plainTextToken;
 
         $this->withToken($token)->postJson('/api/v1/admin/users', [
-            'name' => 'First Teacher', 'email' => 'teacher.one@example.test', 'password' => 'teacher-password-long', 'role' => 'teacher',
+            'name' => 'First Teacher', 'email' => 'teacher.one@example.test', 'phone' => '+15555550101', 'password' => 'teacher-password-long', 'role' => 'teacher',
         ])->assertCreated();
         $this->withToken($token)->postJson('/api/v1/admin/users', [
-            'name' => 'Second Teacher', 'email' => 'teacher.two@example.test', 'password' => 'teacher-password-long', 'role' => 'teacher',
+            'name' => 'Second Teacher', 'email' => 'teacher.two@example.test', 'phone' => '+15555550102', 'password' => 'teacher-password-long', 'role' => 'teacher',
         ])->assertUnprocessable()->assertJsonValidationErrors('role');
         $this->assertDatabaseCount('users', 2);
     }
@@ -236,10 +236,10 @@ class LicensingAndBillingTest extends TestCase
         $license = app(SchoolLicenseService::class)->issue($school, $plan, null, null, null, null);
 
         $this->withToken($this->initialSchoolAdminToken)->postJson('/api/v1/admin/users', [
-            'name' => 'First Teacher', 'email' => 'adware.teacher.one@example.test', 'password' => 'teacher-password-long', 'role' => 'teacher',
+            'name' => 'First Teacher', 'email' => 'adware.teacher.one@example.test', 'phone' => '+15555550103', 'password' => 'teacher-password-long', 'role' => 'teacher',
         ])->assertCreated();
         $this->withToken($this->initialSchoolAdminToken)->postJson('/api/v1/admin/users', [
-            'name' => 'Second Teacher', 'email' => 'adware.teacher.two@example.test', 'password' => 'teacher-password-long', 'role' => 'teacher',
+            'name' => 'Second Teacher', 'email' => 'adware.teacher.two@example.test', 'phone' => '+15555550104', 'password' => 'teacher-password-long', 'role' => 'teacher',
         ])->assertUnprocessable()->assertJsonValidationErrors('role');
 
         $this->assertSame(['students' => 100, 'teachers' => 1], $license->claims['limits']);
