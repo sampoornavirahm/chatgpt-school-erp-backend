@@ -1,0 +1,26 @@
+<?php
+
+return [
+    'trial_enabled' => (bool) env('SCHOOL_ERP_TRIAL_ENABLED', true),
+    'google_client_id' => env('GOOGLE_OAUTH_CLIENT_ID'),
+    'activation_url' => env('SCHOOL_ERP_ACTIVATION_URL'),
+    'activation_shared_secret' => env('SCHOOL_ERP_ACTIVATION_SHARED_SECRET'),
+    'activation_driver' => env('SCHOOL_ERP_ACTIVATION_DRIVER', 'dummy'),
+    'allow_dummy_activations' => (bool) env('SCHOOL_ERP_ALLOW_DUMMY_ACTIVATIONS', env('APP_ENV', 'production') !== 'production'),
+    'firebase_project_id' => env('FIREBASE_PROJECT_ID'),
+    'firebase_service_account' => env('FIREBASE_SERVICE_ACCOUNT_FILE'),
+    'platform_bootstrap_token' => env('SCHOOL_ERP_PLATFORM_BOOTSTRAP_TOKEN'),
+    'webhook_shared_secret' => env('SCHOOL_ERP_WEBHOOK_SHARED_SECRET'),
+    'trial_days' => (int) env('SCHOOL_ERP_TRIAL_DAYS', 15),
+    'trial_max_days' => (int) env('SCHOOL_ERP_TRIAL_MAX_DAYS', 30),
+    'offline_grace_days' => (int) env('SCHOOL_ERP_OFFLINE_GRACE_DAYS', 7),
+    'license_issuer' => env('SCHOOL_ERP_LICENSE_ISSUER', 'School ERP PHP Licensing Service'),
+    'license_key_id' => env('SCHOOL_ERP_LICENSE_KEY_ID', 'local-1'),
+    'license_private_key_path' => env('SCHOOL_ERP_LICENSE_PRIVATE_KEY_PATH', storage_path('app/private/license-signing.key')),
+    'license_public_key_path' => env('SCHOOL_ERP_LICENSE_PUBLIC_KEY_PATH', storage_path('app/private/license-public.key')),
+    'license_auto_generate_local_keys' => (bool) env('SCHOOL_ERP_LICENSE_AUTO_GENERATE_LOCAL_KEYS', true),
+    'payment_driver' => env('SCHOOL_ERP_PAYMENT_DRIVER', 'dummy'),
+    'allow_dummy_payments' => (bool) env('SCHOOL_ERP_ALLOW_DUMMY_PAYMENTS', env('APP_ENV', 'production') !== 'production'),
+    'merchant_upi_vpa' => env('SCHOOL_ERP_MERCHANT_UPI_VPA'),
+    'merchant_upi_name' => env('SCHOOL_ERP_MERCHANT_UPI_NAME', 'School ERP'),
+];

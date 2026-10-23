@@ -1,0 +1,61 @@
+name: Backend CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  mysql-integration:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: school_erp_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -proot"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: mbstring, pdo_mysql
+          coverage: none
+      - name: Prepare Laravel writable directories
+        run: |
+          mkdir -p bootstrap/cache storage/framework/cache storage/framework/views storage/framework/sessions storage/framework/testing storage/app/private
+          chmod -R u+rwX bootstrap/cache storage
+      - name: Install Composer dependencies
+        run: composer install --no-interaction --prefer-dist --no-progress
+      - name: Configure test environment
+        run: |
+          cp .env.example .env
+          php artisan key:generate
+      - name: Run migrations and tests against MySQL
+        run: |
+          php artisan migrate:fresh --force
+          php artisan test
+        env:
+          APP_ENV: testing
+          DB_CONNECTION: mysql
+          DB_HOST: 127.0.0.1
+          DB_PORT: 3306
+          DB_DATABASE: school_erp_test
+          DB_USERNAME: root
+          DB_PASSWORD: root
+          SCHOOL_ERP_LICENSE_AUTO_GENERATE_LOCAL_KEYS: 'true'
+          SCHOOL_ERP_LICENSE_PRIVATE_KEY_PATH: ${{ github.workspace }}/storage/app/private/ci-license-signing.key
+          SCHOOL_ERP_LICENSE_PUBLIC_KEY_PATH: ${{ github.workspace }}/storage/app/private/ci-license-public.key
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

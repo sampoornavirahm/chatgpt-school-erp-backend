@@ -1,0 +1,636 @@
+openapi: 3.1.0
+info:
+  title: School ERP Hosted API
+  version: 0.3.0
+  description: >-
+    Optional outbound School Hub relay and hosted Parent app, plus Phase 8
+    license activation and INR billing. The local School Hub remains
+    authoritative for official school records.
+servers:
+  - url: https://api.example.com/api/v1
+    description: Replace with the school's HTTPS backend URL.
+tags:
+  - name: Operations
+  - name: Hub relay
+  - name: Parent access
+  - name: Webhooks
+  - name: Licensing and billing
+paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Check the API and database connection
+      responses:
+        '200':
+          description: API and database are available.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { const: ok }
+                  service: { const: school-erp-backend }
+                  database: { const: connected }
+                required: [status, service, database]
+        '503':
+          description: Database is unavailable.
+  /licensing/plans:
+    get:
+      tags: [Licensing and billing]
+      summary: List enabled INR plans and current limits
+      responses:
+        '200':
+          description: Enabled plans ordered by display position.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [currency, plans]
+                properties:
+                  currency: { const: INR }
+                  plans:
+                    type: array
+                    items: { $ref: '#/components/schemas/LicensePlan' }
+  /setup/complete:
+    post:
+      tags: [Licensing and billing]
+      summary: Create the installation's school and initial administrator
+      description: Trial bypasses Google and activation checks. Outside trial, both a verified Google ID token and server activation code are required; the dummy provider is local/testing only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [school_name, admin_name, email, password]
+              properties:
+                school_name: { type: string, minLength: 2, maxLength: 160 }
+                admin_name: { type: string, minLength: 2, maxLength: 120 }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 12, maxLength: 128 }
+                google_id_token: { type: string, maxLength: 8192 }
+                activation_code: { type: string, maxLength: 256 }
+      responses:
+        '201':
+          {
+            description: School configured with a signed Starter trial or permanent Starter license and initial admin token.,
+          }
+        '409': { description: Setup already completed. }
+        '422': { description: Required setup fields, Google identity or activation check failed. }
+  /setup/activate:
+    post:
+      tags: [Licensing and billing]
+      summary: Verify Google identity and activate an existing trial school
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [google_id_token, activation_code]
+              properties:
+                google_id_token: { type: string, maxLength: 8192 }
+                activation_code: { type: string, maxLength: 256 }
+      responses:
+        '200': { description: Original administrator verified and school license activated. }
+        '409': { description: A school setup is required. }
+        '422': { description: Google identity or license activation code failed. }
+  /licensing/public-key:
+    get:
+      tags: [Licensing and billing]
+      summary: Retrieve the Ed25519 license verification key
+      responses:
+        '200':
+          description: Public verification key. The private signing key is never returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [algorithm, key_id, public_key]
+                properties:
+                  algorithm: { const: Ed25519 }
+                  key_id: { type: string }
+                  public_key: { type: string, description: Base64url-encoded 32-byte public key. }
+        '503': { description: License keys are not configured. }
+  /licensing/verify:
+    post:
+      tags: [Licensing and billing]
+      summary: Verify a signed license token and report its expiry state
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [token]
+              properties:
+                token: { type: string, maxLength: 8192 }
+      responses:
+        '200': { description: Token signature is valid; state may be active, grace, or expired. }
+        '422': { description: Malformed or invalid token. }
+  /licensing/activate:
+    post:
+      tags: [Licensing and billing]
+      summary: Redeem a one-time school activation code
+      description: Outside trial, a Google ID token for the school's original administrator is required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [school_id, server_id, activation_code]
+              properties:
+                school_id: { type: string, format: uuid }
+                server_id: { type: string, format: uuid }
+                activation_code: { type: string, maxLength: 128 }
+                google_id_token: { type: string, maxLength: 8192 }
+      responses:
+        '200': { description: Signed license issued; retry on the same server is idempotent. }
+        '409': { description: Activation code was already consumed by another server or revoked. }
+        '422': { description: Activation code, server, or Google identity did not validate. }
+  /licensing/status:
+    get:
+      tags: [Licensing and billing]
+      summary: Read the authenticated school's trial and license status
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Current trial dates, signed license and validity state. }
+        '401': { description: Authentication required. }
+  /licensing/current:
+    post:
+      tags: [Licensing and billing]
+      summary: Fetch the latest signed license for a configured local Hub
+      description: Validates the supplied school/server UUID pair. The returned token is bound to that server. Rate limited; never includes provider credentials.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [school_id, server_id]
+              properties:
+                school_id: { type: string, format: uuid }
+                server_id: { type: string, format: uuid }
+      responses:
+        '200': { description: Current signed license and hold state. }
+        '404': { description: School/server pair is not registered. }
+        '429': { description: License check rate limit exceeded. }
+  /licensing/trial-extension-requests:
+    post:
+      tags: [Licensing and billing]
+      summary: Request the school's one 15-day trial extension
+      description: School administrator only. The operator must approve it; requesting never changes the license.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                note: { type: string, maxLength: 500 }
+      responses:
+        '202': { description: Request recorded for operator review. }
+        '409': { description: Trial is not eligible or an extension was already used. }
+  /licensing/trial-extension-requests/server:
+    post:
+      tags: [Licensing and billing]
+      summary: Queue an extension request from a local Hub
+      description: Rate-limited, non-authorizing request keyed to the registered school/server pair; operator approval is still required.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [school_id, server_id]
+              properties:
+                school_id: { type: string, format: uuid }
+                server_id: { type: string, format: uuid }
+                note: { type: string, maxLength: 500 }
+      responses:
+        '202': { description: Request queued for operator review. }
+        '409': { description: Trial is not eligible or extension was already used. }
+        '429': { description: Request rate limit exceeded. }
+  /school/payment-settings:
+    get:
+      tags: [Licensing and billing]
+      summary: Read the school's own payment account configuration
+      description: School administrator only. Credentials are represented by a configured flag and never returned.
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          { description: Provider, public payment instructions and credential-configured status. }
+    put:
+      tags: [Licensing and billing]
+      summary: Configure the school's own fee collection account
+      description: School administrator only. Gateway credential values are encrypted at rest and omitted from all responses.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [provider, is_enabled]
+              properties:
+                provider: { type: string, enum: [none, vpa, razorpay, payu] }
+                merchant_vpa: { type: string, maxLength: 255 }
+                merchant_name: { type: string, maxLength: 120 }
+                provider_account_id: { type: string, maxLength: 160 }
+                credentials:
+                  {
+                    type: object,
+                    additionalProperties: { type: string, maxLength: 1024 },
+                    maxProperties: 12,
+                  }
+                is_enabled: { type: boolean }
+      responses:
+        '200': { description: Safe settings response without credential values. }
+        '422': { description: Provider configuration is incomplete or invalid. }
+  /billing/orders:
+    get:
+      tags: [Licensing and billing]
+      summary: List the signed-in user's recent orders and entitlements
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Up to 50 orders and the signed-in user's current entitlements. }
+    post:
+      tags: [Licensing and billing]
+      summary: Create an INR order with a merchant UPI payment URI when configured
+      description: Price and eligible payer are resolved on the server. This endpoint does not confirm payment.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [plan_key, idempotency_key]
+              properties:
+                plan_key: { type: string, maxLength: 40 }
+                idempotency_key: { type: string, format: uuid }
+                student_seats:
+                  {
+                    type: integer,
+                    minimum: 1,
+                    maximum: 200000,
+                    description: Optional future capacity included in a school-paid Professional order.,
+                  }
+      responses:
+        '201': { description: New pending UPI order. }
+        '200': { description: Idempotent replay of an existing order. }
+        '401': { description: Authentication required. }
+        '422': { description: Plan, payer role, or school capacity is invalid. }
+  /billing/orders/{order}/simulate-payment:
+    parameters:
+      - name: order
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    post:
+      tags: [Licensing and billing]
+      summary: Simulate a payment outcome in local and test environments
+      description: Always disabled in production. A successful simulation grants an entitlement through the PHP backend.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                outcome: { type: string, enum: [paid, failed], default: paid }
+      responses:
+        '200': { description: Payment simulation result or idempotent replay. }
+        '401': { description: Authentication required. }
+        '404': { description: Order is not owned by this school and user. }
+        '503': { description: Payment simulation is disabled. }
+  /relay/schools/{school}/sync/push:
+    parameters:
+      - $ref: '#/components/parameters/SchoolId'
+      - $ref: '#/components/parameters/RelayKey'
+      - $ref: '#/components/parameters/RelayTimestamp'
+      - $ref: '#/components/parameters/RelayNonce'
+      - $ref: '#/components/parameters/RelaySignature'
+    post:
+      tags: [Hub relay]
+      summary: Store a batch of student projections
+      description: >-
+        Maximum 50 snapshots per batch and 1 MB per student snapshot. Each
+        snapshot accepts only student, attendance, timetable, homework,
+        announcements, results and fees. A deleted student uses {deleted:true}.
+        Repeating the same batch ID and body returns the original response.
+      parameters:
+        - $ref: '#/components/parameters/RequestContentType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch_id, snapshots]
+              properties:
+                batch_id: { type: string, format: uuid }
+                snapshots:
+                  type: array
+                  minItems: 1
+                  maxItems: 50
+                  items:
+                    type: object
+                    required: [student_public_id, revision, snapshot]
+                    properties:
+                      student_public_id: { type: string, format: uuid }
+                      revision: { type: integer, minimum: 1 }
+                      snapshot:
+                        type: object
+                        additionalProperties: true
+                        description: Strict allowlisted projection object or a deletion tombstone.
+      responses:
+        '200':
+          description: Idempotent batch result; individual snapshots may be rejected.
+          headers:
+            Idempotency-Replayed:
+              schema: { type: string, enum: ['true', 'false'] }
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        studentPublicId: { type: string, format: uuid }
+                        status: { type: string, enum: [accepted, stale, conflict, rejected] }
+                        revision: { type: integer }
+                        code: { type: string }
+                  storedBytes: { type: integer }
+                  cursor: { type: integer }
+                required: [results, storedBytes, cursor]
+        '401': { description: Missing, invalid, expired or tampered relay signature. }
+        '409': { description: Nonce replay or batch identifier reused with a different payload. }
+        '422': { description: Invalid batch or unsupported snapshot fields. }
+        '429': { description: Relay request rate limit exceeded. }
+  /relay/schools/{school}/sync/pull:
+    parameters:
+      - $ref: '#/components/parameters/SchoolId'
+      - $ref: '#/components/parameters/RelayKey'
+      - $ref: '#/components/parameters/RelayTimestamp'
+      - $ref: '#/components/parameters/RelayNonce'
+      - $ref: '#/components/parameters/RelaySignature'
+    get:
+      tags: [Hub relay]
+      summary: Pull queued parent commands
+      parameters:
+        - name: cursor
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+      responses:
+        '200':
+          description: Up to 100 queued parent commands after the cursor.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  commands: { type: array, items: { $ref: '#/components/schemas/ParentCommand' } }
+                  cursor: { type: integer }
+                required: [commands, cursor]
+        '401': { description: Invalid relay signature. }
+        '409': { description: Nonce replay. }
+        '429': { description: Relay request rate limit exceeded. }
+  /relay/schools/{school}/sync/ack:
+    parameters:
+      - $ref: '#/components/parameters/SchoolId'
+      - $ref: '#/components/parameters/RelayKey'
+      - $ref: '#/components/parameters/RelayTimestamp'
+      - $ref: '#/components/parameters/RelayNonce'
+      - $ref: '#/components/parameters/RelaySignature'
+    post:
+      tags: [Hub relay]
+      summary: Acknowledge locally processed parent commands
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [results]
+              properties:
+                results:
+                  type: array
+                  minItems: 1
+                  maxItems: 100
+                  items:
+                    type: object
+                    required: [operation_id, status]
+                    properties:
+                      operation_id: { type: string, format: uuid }
+                      status: { type: string, enum: [accepted, rejected] }
+                      message: { type: string, maxLength: 240 }
+      responses:
+        '200':
+          description: Number of command states updated for this school.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties: { updated: { type: integer } }
+                required: [updated]
+        '401': { description: Invalid relay signature. }
+        '409': { description: Nonce replay. }
+        '422': { description: Invalid acknowledgement batch. }
+  /parent/children:
+    get:
+      tags: [Parent access]
+      summary: Read synchronized children explicitly linked to the signed-in parent
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Only non-deleted children linked to this parent in this school.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  children:
+                    { type: array, items: { $ref: '#/components/schemas/ParentProjection' } }
+                  syncedAt: { type: string, format: date-time }
+                required: [children, syncedAt]
+        '401': { description: Authentication required. }
+        '403': { description: Parent role required. }
+  /parent/commands:
+    get:
+      tags: [Parent access]
+      summary: Read this parent's queued request statuses
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: At most 100 requests belonging to this parent and school. }
+        '401': { description: Authentication required. }
+        '403': { description: Parent role required. }
+    post:
+      tags: [Parent access]
+      summary: Queue an idempotent parent request for the local Hub
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operation_id, student_public_id, operation, payload]
+              properties:
+                operation_id: { type: string, format: uuid }
+                student_public_id: { type: string, format: uuid }
+                operation: { const: parent_request.submit }
+                payload:
+                  type: object
+                  required: [request_type, message]
+                  properties:
+                    request_type: { type: string, enum: [leave, profile_change, document, other] }
+                    starts_on: { type: [string, 'null'], format: date }
+                    ends_on: { type: [string, 'null'], format: date }
+                    message: { type: string, minLength: 3, maxLength: 1000 }
+      responses:
+        '202': { description: Request queued for the school's next relay poll. }
+        '200': { description: Identical operation ID already recorded for this parent. }
+        '401': { description: Authentication required. }
+        '403': { description: Parent role required. }
+        '404': { description: Student is not linked to this parent in this school. }
+        '409': { description: Operation ID conflicts with a different parent. }
+  /webhooks/{provider}:
+    parameters:
+      - name: provider
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[a-z0-9_-]{2,40}$' }
+      - name: X-Webhook-Timestamp
+        in: header
+        required: true
+        schema: { type: string }
+      - name: X-Webhook-Event-ID
+        in: header
+        required: true
+        schema: { type: string, maxLength: 180 }
+      - name: X-Webhook-Signature
+        in: header
+        required: true
+        schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+    post:
+      tags: [Webhooks]
+      summary: Record a signed provider webhook for later processing
+      description: >-
+        The current endpoint verifies a shared HMAC secret and timestamp, then
+        deduplicates by provider and event ID. It records the payload hash only;
+        it does not process payments or change entitlements.
+      requestBody:
+        required: true
+        content:
+          application/json: { schema: { type: object, additionalProperties: true } }
+      responses:
+        '202': { description: New webhook receipt stored as received_unprocessed. }
+        '200': { description: Matching event ID and payload already recorded. }
+        '401': { description: Invalid provider signature or timestamp. }
+        '409': { description: Event ID reused with a different payload. }
+        '503': { description: Webhook secret is not configured or receipt storage failed. }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Sanctum token
+  parameters:
+    SchoolId:
+      name: school
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    RelayKey:
+      name: X-Relay-Key
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+    RelayTimestamp:
+      name: X-Relay-Timestamp
+      in: header
+      required: true
+      description: Unix timestamp in seconds; accepted within five minutes of server time.
+      schema: { type: string, pattern: '^[0-9]+$' }
+    RelayNonce:
+      name: X-Relay-Nonce
+      in: header
+      required: true
+      description: Unique random base64url nonce per signed request.
+      schema: { type: string, minLength: 20, maxLength: 64 }
+    RelaySignature:
+      name: X-Relay-Signature
+      in: header
+      required: true
+      description: Lowercase hex HMAC-SHA256 over method, exact path/query, timestamp, nonce and lowercase SHA-256 body hash, separated by newlines.
+      schema: { type: string, pattern: '^[a-f0-9]{64}$' }
+    RequestContentType:
+      name: Content-Type
+      in: header
+      required: true
+      schema: { const: application/json }
+  schemas:
+    LicensePlan:
+      type: object
+      required:
+        [
+          key,
+          name,
+          description,
+          currency,
+          billing_period,
+          billing_mode,
+          feature_flags,
+          ad_supported,
+        ]
+      properties:
+        key: { type: string }
+        name: { type: string }
+        description: { type: string }
+        currency: { const: INR }
+        billing_period: { type: string, enum: [free, annual, custom] }
+        billing_mode: { type: string, enum: [free, ad_supported, upfront, installments] }
+        school_price_paise: { type: [integer, 'null'], minimum: 0 }
+        student_price_paise: { type: [integer, 'null'], minimum: 0 }
+        parent_price_paise: { type: [integer, 'null'], minimum: 0 }
+        teacher_price_paise: { type: [integer, 'null'], minimum: 0 }
+        student_limit:
+          {
+            type: [integer, 'null'],
+            minimum: 1,
+            description: Basic Adware defaults to Starter's 100-student cap; operators may configure it.,
+          }
+        teacher_limit:
+          {
+            type: [integer, 'null'],
+            minimum: 1,
+            description: Basic Adware defaults to Starter's 1-teacher cap; operators may configure it.,
+          }
+        feature_flags: { type: array, items: { type: string } }
+        ad_supported: { type: boolean }
+    ParentCommand:
+      type: object
+      properties:
+        cursor: { type: integer }
+        operationId: { type: string, format: uuid }
+        userId: { type: integer }
+        studentPublicId: { type: string, format: uuid }
+        operation: { const: parent_request.submit }
+        payload: { type: object, additionalProperties: true }
+        createdAt: { type: string, format: date-time }
+      required: [cursor, operationId, userId, studentPublicId, operation, payload, createdAt]
+    ParentProjection:
+      type: object
+      properties:
+        studentPublicId: { type: string, format: uuid }
+        revision: { type: integer }
+        snapshot: { type: object, additionalProperties: true }
+        projectedAt: { type: string, format: date-time }
+      required: [studentPublicId, revision, snapshot, projectedAt]
