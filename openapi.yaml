@@ -13,6 +13,7 @@ tags:
   - name: Operations
   - name: Hub relay
   - name: Parent access
+  - name: Account security
   - name: Webhooks
   - name: Licensing and billing
 paths:
@@ -321,6 +322,8 @@ paths:
         Maximum 50 snapshots per batch and 1 MB per student snapshot. Each
         snapshot accepts only student, attendance, timetable, homework,
         announcements, results and fees. A deleted student uses {deleted:true}.
+        Attendance entries preserve their date, period (0 means full day),
+        status key, school-defined display label and reason for parent views.
         Repeating the same batch ID and body returns the original response.
       parameters:
         - $ref: '#/components/parameters/RequestContentType'
@@ -373,6 +376,103 @@ paths:
         '401': { description: Missing, invalid, expired or tampered relay signature. }
         '409': { description: Nonce replay or batch identifier reused with a different payload. }
         '422': { description: Invalid batch or unsupported snapshot fields. }
+        '429': { description: Relay request rate limit exceeded. }
+  /relay/schools/{school}/calendar:
+    parameters:
+      - $ref: '#/components/parameters/SchoolId'
+      - $ref: '#/components/parameters/RelayKey'
+      - $ref: '#/components/parameters/RelayTimestamp'
+      - $ref: '#/components/parameters/RelayNonce'
+      - $ref: '#/components/parameters/RelaySignature'
+    post:
+      tags: [Hub relay]
+      summary: Store the revisioned school calendar projection
+      description: >-
+        The Hub sends at most 300 calendar events and 1 MB of JSON. The SHA-256
+        content hash covers the UTF-8 JSON encoding of the events array. An
+        identical revision and hash is idempotent; a lower revision is stale,
+        and a changed payload at the same revision conflicts. A changed calendar
+        triggers schedule-update notifications for active parents and teachers.
+      parameters:
+        - $ref: '#/components/parameters/RequestContentType'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [revision, content_hash, events]
+              properties:
+                revision: { type: integer, minimum: 1 }
+                content_hash: { type: string, pattern: '^[a-f0-9]{64}$' }
+                events:
+                  type: array
+                  maxItems: 300
+                  items: { $ref: '#/components/schemas/SchoolCalendarEvent' }
+      responses:
+        '200':
+          description: Calendar accepted, unchanged, or idempotently replayed.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, enum: [accepted, unchanged] }
+                  revision: { type: integer }
+                required: [status, revision]
+        '403': { description: School license is suspended or expired. }
+        '404': { description: School was not found. }
+        '409': { description: Calendar revision is stale or conflicts with an existing payload. }
+        '422': { description: Calendar event validation, hash, or payload size failed. }
+        '429': { description: Relay request rate limit exceeded. }
+  /relay/schools/{school}/accounts/sync:
+    parameters:
+      - $ref: '#/components/parameters/SchoolId'
+      - $ref: '#/components/parameters/RelayKey'
+      - $ref: '#/components/parameters/RelayTimestamp'
+      - $ref: '#/components/parameters/RelayNonce'
+      - $ref: '#/components/parameters/RelaySignature'
+    post:
+      tags: [Hub relay]
+      summary: Synchronize mobile account contacts and parent-child access
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [accounts]
+              properties:
+                accounts:
+                  type: array
+                  maxItems: 500
+                  items:
+                    type: object
+                    required: [relay_user_id, name, email, phone, role, is_active]
+                    properties:
+                      relay_user_id: { type: integer, minimum: 1 }
+                      name: { type: string, minLength: 2, maxLength: 120 }
+                      email: { type: string, format: email, maxLength: 255 }
+                      phone: { type: string, maxLength: 24 }
+                      role: { type: string, enum: [parent, teacher] }
+                      is_active: { type: boolean }
+                      student_public_ids:
+                        type: array
+                        maxItems: 100
+                        items: { type: string, format: uuid }
+                      student_access:
+                        type: array
+                        maxItems: 100
+                        items:
+                          type: object
+                          required: [student_public_id, access_level]
+                          properties:
+                            student_public_id: { type: string, format: uuid }
+                            access_level: { type: string, enum: [full, schedule_only] }
+      responses:
+        '200': { description: Contacts and per-child authorization synchronized. }
+        '401': { description: Invalid relay signature. }
+        '422': { description: Account details or student links are invalid. }
         '429': { description: Relay request rate limit exceeded. }
   /relay/schools/{school}/sync/pull:
     parameters:
@@ -443,14 +543,47 @@ paths:
         '401': { description: Invalid relay signature. }
         '409': { description: Nonce replay. }
         '422': { description: Invalid acknowledgement batch. }
-  /parent/children:
+  /auth/sessions:
     get:
-      tags: [Parent access]
-      summary: Read synchronized children explicitly linked to the signed-in parent
+      tags: [Account security]
+      summary: List active sessions for the verified account across its linked school accounts
       security: [{ bearerAuth: [] }]
       responses:
         '200':
-          description: Only non-deleted children linked to this parent in this school.
+          { description: At most 100 unexpired sessions, with device labels and last-use times. }
+        '401': { description: Authentication required. }
+        '403': { description: Parent or teacher role required. }
+    delete:
+      tags: [Account security]
+      summary: Revoke every session belonging to the verified parent or teacher identity
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: All sessions were revoked; the caller must sign in again. }
+        '401': { description: Authentication required. }
+        '403': { description: Parent or teacher role required. }
+  /auth/sessions/{session}:
+    parameters:
+      - name: session
+        in: path
+        required: true
+        schema: { type: string, pattern: '^[0-9]+$' }
+    delete:
+      tags: [Account security]
+      summary: Revoke one session belonging to the verified parent or teacher identity
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200': { description: Session revoked; signedOut indicates if it was the current session. }
+        '401': { description: Authentication required. }
+        '403': { description: Parent or teacher role required. }
+        '404': { description: Session does not belong to the signed-in account. }
+  /parent/children:
+    get:
+      tags: [Parent access]
+      summary: Read synchronized children explicitly linked across the signed-in parent's verified school accounts
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Only non-deleted children linked to active school accounts with the same verified Google identity, email, and phone. Schedule-only links contain child name/class and timetable only; private records and request actions are withheld server-side.
           content:
             application/json:
               schema:
@@ -458,17 +591,82 @@ paths:
                 properties:
                   children:
                     { type: array, items: { $ref: '#/components/schemas/ParentProjection' } }
+                  calendarEvents:
+                    type: array
+                    items: { $ref: '#/components/schemas/SchoolCalendarEvent' }
+                  calendarProjectedAt: { type: [string, 'null'], format: date-time }
+                  calendarProjectedAtBySchool:
+                    type: object
+                    additionalProperties: { type: string, format: date-time }
                   syncedAt: { type: string, format: date-time }
-                required: [children, syncedAt]
+                required:
+                  [
+                    children,
+                    calendarEvents,
+                    calendarProjectedAt,
+                    calendarProjectedAtBySchool,
+                    syncedAt,
+                  ]
         '401': { description: Authentication required. }
         '403': { description: Parent role required. }
+  /parent/children/{student}:
+    parameters:
+      - name: student
+        in: path
+        required: true
+        schema: { type: string, format: uuid }
+    get:
+      tags: [Parent access]
+      summary: Read one explicitly linked child's synchronized school snapshot
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Child snapshot and that school's projected calendar from an active account linked to this verified parent identity.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  studentPublicId: { type: string, format: uuid }
+                  schoolId: { type: string, format: uuid }
+                  schoolName: { type: string }
+                  linkStatus: { type: string, enum: [linked] }
+                  accessLevel: { type: string, enum: [full, schedule_only] }
+                  revision: { type: integer }
+                  snapshot: { $ref: '#/components/schemas/ParentStudentSnapshot' }
+                  calendarEvents:
+                    type: array
+                    items: { $ref: '#/components/schemas/SchoolCalendarEvent' }
+                  calendarProjectedAt: { type: [string, 'null'], format: date-time }
+                  calendarProjectedAtBySchool:
+                    type: object
+                    additionalProperties: { type: string, format: date-time }
+                  projectedAt: { type: string, format: date-time }
+                required:
+                  [
+                    studentPublicId,
+                    schoolId,
+                    schoolName,
+                    linkStatus,
+                    accessLevel,
+                    revision,
+                    snapshot,
+                    calendarEvents,
+                    calendarProjectedAt,
+                    calendarProjectedAtBySchool,
+                    projectedAt,
+                  ]
+        '401': { description: Authentication required. }
+        '403': { description: Parent role required. }
+        '404': { description: Child is not linked to this verified identity. }
   /parent/commands:
     get:
       tags: [Parent access]
       summary: Read this parent's queued request statuses
       security: [{ bearerAuth: [] }]
       responses:
-        '200': { description: At most 100 requests belonging to this parent and school. }
+        '200':
+          { description: At most 100 requests belonging to this parent's verified school accounts. }
         '401': { description: Authentication required. }
         '403': { description: Parent role required. }
     post:
@@ -490,8 +688,24 @@ paths:
                   type: object
                   required: [request_type, message]
                   properties:
-                    request_type: { type: string, enum: [leave, profile_change, document, other] }
-                    starts_on: { type: [string, 'null'], format: date }
+                    request_type:
+                      type: string
+                      enum:
+                        [
+                          leave,
+                          profile_change,
+                          document,
+                          other,
+                          data_access,
+                          data_correction,
+                          data_deletion,
+                          attendance_correction,
+                        ]
+                      description: Data access/correction/deletion are sent for school review; submitting a request never changes or deletes school records automatically.
+                    starts_on:
+                      type: [string, 'null']
+                      format: date
+                      description: Required and not in the future for attendance_correction; optional for other request types.
                     ends_on: { type: [string, 'null'], format: date }
                     message: { type: string, minLength: 3, maxLength: 1000 }
       responses:
@@ -501,6 +715,122 @@ paths:
         '403': { description: Parent role required. }
         '404': { description: Student is not linked to this parent in this school. }
         '409': { description: Operation ID conflicts with a different parent. }
+  /parent/support-tickets/public-login:
+    post:
+      tags: [Parent access]
+      summary: Submit a rate-limited parent sign-in help request before authentication
+      description: Unverified contact details are visible only to platform operators. The sender can see the response in the authenticated parent app only after signing in with the same registered Google email and phone. The operator must verify identity and manually route the request; this endpoint sends no email.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operation_id, name, email, phone, subject, message]
+              properties:
+                operation_id: { type: string, format: uuid }
+                name: { type: string, minLength: 2, maxLength: 120 }
+                email: { type: string, format: email, maxLength: 255 }
+                phone: { type: string, minLength: 8, maxLength: 24 }
+                school: { type: [string, 'null'], maxLength: 160 }
+                subject: { type: string, minLength: 4, maxLength: 160 }
+                message: { type: string, minLength: 10, maxLength: 3000 }
+      responses:
+        '201': { description: Login-support request accepted with reference and initial status. }
+        '200': { description: Idempotent replay of the same request. }
+        '409': { description: Operation ID was already used for different request details. }
+        '422': { description: Contact or request details failed validation. }
+        '429': { description: Public support request rate limit reached. }
+  /parent/support-tickets:
+    get:
+      tags: [Parent access]
+      summary: List support requests for the signed-in parent's verified school accounts
+      security: [{ bearerAuth: [] }]
+      responses:
+        '200':
+          description: Up to 50 recent requests for the signed-in verified family accounts, including pre-login requests with the same recorded email and phone, status, school or platform routing, and the latest public response.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [tickets]
+                properties:
+                  tickets:
+                    type: array
+                    items:
+                      type: object
+                      required:
+                        [
+                          reference,
+                          schoolId,
+                          schoolName,
+                          category,
+                          subject,
+                          message,
+                          status,
+                          escalationTarget,
+                          createdAt,
+                          updatedAt,
+                        ]
+                      properties:
+                        reference: { type: string, example: SUP-0123456789ABCDEF }
+                        schoolId: { type: [string, 'null'], format: uuid }
+                        schoolName: { type: [string, 'null'] }
+                        studentPublicId: { type: [string, 'null'], format: uuid }
+                        category: { type: string }
+                        subject: { type: string }
+                        message: { type: string }
+                        status:
+                          {
+                            type: string,
+                            enum:
+                              [open, in_progress, waiting_on_parent, escalated, resolved, closed],
+                          }
+                        escalationTarget: { type: string, enum: [school, platform] }
+                        response: { type: [string, 'null'] }
+                        createdAt: { type: string, format: date-time }
+                        updatedAt: { type: string, format: date-time }
+        '401': { description: Authentication required. }
+        '403': { description: Parent role required. }
+    post:
+      tags: [Parent access]
+      summary: Create an idempotent parent support request
+      description: Requests are visible in the operator support inbox. School routing is a manual handoff; this endpoint does not send email or guarantee an external response.
+      security: [{ bearerAuth: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [operation_id, category, subject, message]
+              properties:
+                operation_id: { type: string, format: uuid }
+                student_public_id: { type: [string, 'null'], format: uuid }
+                category:
+                  type: string
+                  enum:
+                    [
+                      login_access,
+                      child_linking,
+                      record_visibility,
+                      school_fees,
+                      platform_payments,
+                      backup_restore,
+                      ads,
+                      purchases,
+                      technical_issue,
+                      other,
+                    ]
+                subject: { type: string, minLength: 4, maxLength: 160 }
+                message: { type: string, minLength: 10, maxLength: 3000 }
+      responses:
+        '201': { description: Support request created with reference and initial status. }
+        '200': { description: Identical operation ID already recorded. }
+        '401': { description: Authentication required. }
+        '403': { description: Parent role or school account required. }
+        '404': { description: Child is not linked to this verified parent identity. }
+        '409': { description: Operation ID conflicts or child link is ambiguous. }
   /webhooks/{provider}:
     parameters:
       - name: provider
@@ -630,7 +960,62 @@ components:
       type: object
       properties:
         studentPublicId: { type: string, format: uuid }
+        schoolId: { type: string, format: uuid }
+        schoolName: { type: string }
+        linkStatus: { type: string, enum: [linked] }
+        accessLevel: { type: string, enum: [full, schedule_only] }
         revision: { type: integer }
-        snapshot: { type: object, additionalProperties: true }
+        snapshot: { $ref: '#/components/schemas/ParentStudentSnapshot' }
         projectedAt: { type: string, format: date-time }
-      required: [studentPublicId, revision, snapshot, projectedAt]
+      required:
+        [
+          studentPublicId,
+          schoolId,
+          schoolName,
+          linkStatus,
+          accessLevel,
+          revision,
+          snapshot,
+          projectedAt,
+        ]
+    ParentStudentSnapshot:
+      type: object
+      properties:
+        student:
+          type: object
+          properties:
+            fullName: { type: string }
+            className: { type: string }
+            sectionName: { type: string }
+          additionalProperties: true
+        timetable:
+          type: array
+          items: { $ref: '#/components/schemas/ParentTimetableEntry' }
+      additionalProperties: true
+    ParentTimetableEntry:
+      type: object
+      properties:
+        weekday: { type: integer, minimum: 0, maximum: 6 }
+        period: { type: integer, minimum: 1 }
+        startTime: { type: string }
+        endTime: { type: string }
+        room: { type: [string, 'null'] }
+        subjectName: { type: string }
+        teacherName:
+          { type: [string, 'null'], description: Teacher assigned to the timetable entry. }
+      required: [weekday, period, startTime, endTime, subjectName]
+      additionalProperties: true
+    SchoolCalendarEvent:
+      type: object
+      properties:
+        id: { type: integer, minimum: 1 }
+        title: { type: string, maxLength: 160 }
+        eventType:
+          { type: string, enum: [holiday, closure, exam, trip, deadline, event, ptm, other] }
+        startDate: { type: string, format: date }
+        endDate: { type: [string, 'null'], format: date }
+        notes: { type: [string, 'null'], maxLength: 2000 }
+        schoolId: { type: string, format: uuid, description: Added by the PHP parent API response. }
+        schoolName: { type: string, description: Added by the PHP parent API response. }
+      required: [id, title, eventType, startDate]
+      additionalProperties: false

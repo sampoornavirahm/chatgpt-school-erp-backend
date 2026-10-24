@@ -47,6 +47,52 @@ class FcmSender
         }
     }
 
+    /** @param list<int> $userIds */
+    public function sendScheduleUpdate(string $schoolId, array $userIds): int
+    {
+        if ($userIds === []) {
+            return 0;
+        }
+
+        try {
+            return $this->sendToDevices(
+                $schoolId,
+                $userIds,
+                'schedule_update',
+                'School schedule updated',
+                'Open Learning to see the latest timetable and calendar.',
+            );
+        } catch (Throwable) {
+            // Schedule data still appears in the synced in-app view when push is unavailable.
+            Log::warning('Optional schedule update push could not be sent.');
+
+            return 0;
+        }
+    }
+
+    /** @param list<int> $userIds */
+    public function sendHomeworkUpdate(string $schoolId, array $userIds): int
+    {
+        if ($userIds === []) {
+            return 0;
+        }
+
+        try {
+            return $this->sendToDevices(
+                $schoolId,
+                $userIds,
+                'homework_update',
+                'New homework is available',
+                'Open School ERP to review the assignment and due date.',
+            );
+        } catch (Throwable) {
+            // Assignment details are available in the synced parent view when push is unavailable.
+            Log::warning('Optional homework push could not be sent.');
+
+            return 0;
+        }
+    }
+
     /** @param list<int>|null $userIds */
     private function sendToDevices(
         string $schoolId,
@@ -72,6 +118,18 @@ class FcmSender
             ->select(['mobile_devices.id', 'mobile_devices.fid_ciphertext']);
         if ($userIds !== null) {
             $installationsQuery->whereIn('users.id', $userIds);
+        }
+        if (in_array($type, ['school_notice', 'schedule_update', 'homework_update'], true)) {
+            $installationsQuery->where(function ($query) use ($type): void {
+                $query->where('users.role', '<>', 'parent')
+                    ->orWhereNotExists(function ($preferences) use ($type): void {
+                        $preferences->selectRaw('1')
+                            ->from('parent_notification_preferences')
+                            ->whereColumn('parent_notification_preferences.user_id', 'users.id')
+                            ->where('parent_notification_preferences.category', $type)
+                            ->where('parent_notification_preferences.enabled', false);
+                    });
+            });
         }
         $installations = $installationsQuery->get();
 

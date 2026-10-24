@@ -56,6 +56,10 @@ class RelaySyncTest extends TestCase
                 'role' => 'parent',
                 'is_active' => true,
                 'student_public_ids' => [$firstStudent, $secondStudent],
+                'student_access' => [
+                    ['student_public_id' => $firstStudent, 'access_level' => 'full'],
+                    ['student_public_id' => $secondStudent, 'access_level' => 'schedule_only'],
+                ],
             ]],
         ];
 
@@ -65,6 +69,23 @@ class RelaySyncTest extends TestCase
         $this->assertSame('parent@example.test', $parent->email);
         $this->assertSame('919876543210', $parent->phone);
         $this->assertDatabaseCount('relay_parent_links', 2);
+        $this->assertDatabaseHas('relay_parent_links', [
+            'user_id' => $parent->id,
+            'student_public_id' => $firstStudent,
+            'access_level' => 'full',
+        ]);
+        $this->assertDatabaseHas('relay_parent_links', [
+            'user_id' => $parent->id,
+            'student_public_id' => $secondStudent,
+            'access_level' => 'schedule_only',
+        ]);
+        $payload['accounts'][0]['student_access'][1]['access_level'] = 'full';
+        $this->signedJson('POST', $uri, $payload, $credential)->assertOk();
+        $this->assertDatabaseHas('relay_parent_links', [
+            'user_id' => $parent->id,
+            'student_public_id' => $secondStudent,
+            'access_level' => 'full',
+        ]);
         $parent->createToken('mobile-session', ['parent']);
 
         $payload['accounts'][0]['is_active'] = false;
@@ -119,6 +140,138 @@ class RelaySyncTest extends TestCase
         $this->signedJson('POST', $uri, $rejectedNotice)
             ->assertOk()
             ->assertJsonPath('results.0.code', 'SCHOOL_STORAGE_QUOTA_EXCEEDED');
+        $this->app->terminate();
+    }
+
+    public function test_new_published_homework_notifies_linked_parent_once_and_batch_replay_does_not_repeat_it(): void
+    {
+        $school = $this->createSchool();
+        $this->addRelayCredential($school);
+        $parent = User::factory()->for($school)->state([
+            'name' => 'Homework Parent',
+            'email' => 'homework-parent@example.test',
+            'password' => 'parent-password-long',
+            'role' => 'parent',
+            'is_active' => true,
+        ])->create();
+        $studentId = (string) Str::uuid();
+        DB::table('relay_parent_links')->insert([
+            'school_id' => $school->id,
+            'user_id' => $parent->id,
+            'student_public_id' => $studentId,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+        $this->mock(FcmSender::class, function ($mock) use ($school, $parent): void {
+            $mock->shouldReceive('sendHomeworkUpdate')
+                ->twice()
+                ->with($school->id, [$parent->id])
+                ->andReturn(1);
+            $mock->shouldNotReceive('sendScheduleUpdate');
+        });
+
+        $uri = "/api/v1/relay/schools/{$school->id}/sync/push";
+        $snapshot = function (int $revision, array $homework) use ($studentId): array {
+            $body = $this->snapshotBatch((string) Str::uuid(), $studentId, $revision, 'Asha Rao');
+            $body['snapshots'][0]['snapshot']['homework'] = $homework;
+
+            return $body;
+        };
+        $initial = $snapshot(1, []);
+        $firstAssignment = ['id' => 71, 'title' => 'Read chapter one', 'dueOn' => '2026-11-01'];
+        $published = $snapshot(2, [$firstAssignment]);
+
+        $this->signedJson('POST', $uri, $initial)->assertOk();
+        $this->signedJson('POST', $uri, $published)->assertOk();
+        $this->signedJson('POST', $uri, $published)->assertOk()->assertHeader('Idempotency-Replayed', 'true');
+        $updatedExisting = $firstAssignment;
+        $updatedExisting['title'] = 'Read chapter one and answer the questions';
+        $this->signedJson('POST', $uri, $snapshot(3, [$updatedExisting]))->assertOk();
+        $secondAssignment = ['id' => 72, 'title' => 'Bring a notebook', 'dueOn' => '2026-11-02'];
+        $this->signedJson('POST', $uri, $snapshot(4, [$updatedExisting, $secondAssignment]))->assertOk();
+
+        $this->app->terminate();
+    }
+
+    public function test_school_calendar_projection_is_revisioned_idempotent_and_notifies_active_families(): void
+    {
+        $school = $this->createSchool();
+        $credential = $this->addRelayCredential($school);
+        $parent = User::factory()->for($school)->state([
+            'name' => 'Calendar Parent',
+            'email' => 'calendar-parent@example.test',
+            'password' => 'parent-password-long',
+            'role' => 'parent',
+            'is_active' => true,
+        ])->create();
+        $teacher = User::factory()->for($school)->state([
+            'name' => 'Calendar Teacher',
+            'email' => 'calendar-teacher@example.test',
+            'password' => 'teacher-password-long',
+            'role' => 'teacher',
+            'is_active' => true,
+        ])->create();
+        $this->mock(FcmSender::class, function ($mock) use ($school, $parent, $teacher): void {
+            $mock->shouldReceive('sendScheduleUpdate')
+                ->once()
+                ->with($school->id, [$parent->id, $teacher->id])
+                ->andReturn(2);
+        });
+
+        $uri = "/api/v1/relay/schools/{$school->id}/calendar";
+        $events = [
+            [
+                'id' => 8,
+                'title' => 'Term begins',
+                'eventType' => 'event',
+                'startDate' => '2026-11-02',
+                'endDate' => null,
+                'notes' => 'Classes resume',
+            ],
+            [
+                'id' => 9,
+                'title' => 'Grade 5 field trip',
+                'eventType' => 'trip',
+                'startDate' => '2026-11-12',
+                'endDate' => '2026-11-12',
+                'notes' => 'Permission slips required',
+            ],
+            [
+                'id' => 10,
+                'title' => 'Science project submission',
+                'eventType' => 'deadline',
+                'startDate' => '2026-11-14',
+                'endDate' => null,
+                'notes' => 'Submit to class teacher',
+            ],
+        ];
+        $calendarBody = static fn (int $revision, array $calendarEvents): array => [
+            'revision' => $revision,
+            'content_hash' => hash('sha256', json_encode($calendarEvents, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)),
+            'events' => $calendarEvents,
+        ];
+
+        $this->signedJson('POST', $uri, $calendarBody(1, $events), $credential)
+            ->assertOk()->assertJsonPath('status', 'accepted')->assertJsonPath('revision', 1);
+        $this->signedJson('POST', $uri, $calendarBody(1, $events), $credential)
+            ->assertOk()->assertJsonPath('status', 'unchanged');
+
+        $changedEvents = $events;
+        $changedEvents[0]['notes'] = 'Classes resume at 8 AM';
+        $this->signedJson('POST', $uri, $calendarBody(2, $changedEvents), $credential)
+            ->assertOk()->assertJsonPath('status', 'accepted')->assertJsonPath('revision', 2);
+        $this->signedJson('POST', $uri, $calendarBody(1, $events), $credential)
+            ->assertConflict()->assertJsonPath('status', 'stale');
+        $conflictingEvents = $changedEvents;
+        $conflictingEvents[0]['title'] = 'Conflicting title';
+        $this->signedJson('POST', $uri, $calendarBody(2, $conflictingEvents), $credential)
+            ->assertConflict()->assertJsonPath('error.code', 'CALENDAR_REVISION_CONFLICT');
+
+        $this->assertDatabaseHas('relay_school_calendars', [
+            'school_id' => $school->id,
+            'revision' => 2,
+            'content_hash' => $calendarBody(2, $changedEvents)['content_hash'],
+        ]);
         $this->app->terminate();
     }
 
@@ -238,6 +391,38 @@ class RelaySyncTest extends TestCase
         $this->signedJson('POST', "/api/v1/relay/schools/{$school->id}/sync/ack", ['results' => [['operation_id' => $operationId, 'status' => 'accepted', 'message' => 'Request recorded']]])
             ->assertOk()->assertJsonPath('updated', 1);
         $this->assertDatabaseHas('relay_parent_commands', ['operation_id' => $operationId, 'status' => 'accepted']);
+        $this->signedJson('POST', "/api/v1/relay/schools/{$school->id}/sync/ack", ['results' => [['operation_id' => $operationId, 'status' => 'request_approved', 'message' => 'Approved by the school.']]])
+            ->assertOk()->assertJsonPath('updated', 1);
+        $this->assertDatabaseHas('relay_parent_commands', ['operation_id' => $operationId, 'status' => 'request_approved', 'result_message' => 'Approved by the school.']);
+        $needsInfoOperation = (string) Str::uuid();
+        DB::table('relay_parent_commands')->insert([
+            'school_id' => $school->id, 'operation_id' => $needsInfoOperation, 'user_id' => $parent->id,
+            'student_public_id' => $studentId, 'operation' => 'parent_request.submit',
+            'payload' => json_encode(['request_type' => 'leave', 'message' => 'Medical leave'], JSON_THROW_ON_ERROR),
+            'status' => 'accepted', 'created_at' => now(),
+        ]);
+        $this->signedJson('POST', "/api/v1/relay/schools/{$school->id}/sync/ack", ['results' => [['operation_id' => $needsInfoOperation, 'status' => 'needs_info', 'message' => 'Please add the return date.']]])
+            ->assertOk()->assertJsonPath('updated', 1);
+        $this->assertDatabaseHas('relay_parent_commands', ['operation_id' => $needsInfoOperation, 'status' => 'needs_info']);
+        $rejectedOperation = (string) Str::uuid();
+        DB::table('relay_parent_commands')->insert([
+            'school_id' => $school->id, 'operation_id' => $rejectedOperation, 'user_id' => $parent->id,
+            'student_public_id' => $studentId, 'operation' => 'parent_request.submit',
+            'payload' => json_encode(['request_type' => 'leave', 'message' => 'Medical leave'], JSON_THROW_ON_ERROR),
+            'status' => 'accepted', 'created_at' => now(),
+        ]);
+        $this->signedJson('POST', "/api/v1/relay/schools/{$school->id}/sync/ack", ['results' => [['operation_id' => $rejectedOperation, 'status' => 'request_rejected', 'message' => 'The school declined this request.']]])
+            ->assertOk()->assertJsonPath('updated', 1);
+        $this->assertDatabaseHas('relay_parent_commands', ['operation_id' => $rejectedOperation, 'status' => 'request_rejected']);
+        DB::table('relay_parent_links')->insert([
+            'school_id' => $school->id, 'user_id' => $parent->id, 'student_public_id' => $studentId,
+            'access_level' => 'full', 'created_at' => now(), 'updated_at' => now(),
+        ]);
+        $parentToken = $parent->createToken('parent-status-test', ['parent'])->plainTextToken;
+        $this->withToken($parentToken)->getJson('/api/v1/parent/commands')->assertOk()
+            ->assertJsonFragment(['operationId' => $operationId, 'status' => 'request_approved', 'message' => 'Approved by the school.'])
+            ->assertJsonFragment(['operationId' => $needsInfoOperation, 'status' => 'needs_info', 'message' => 'Please add the return date.'])
+            ->assertJsonFragment(['operationId' => $rejectedOperation, 'status' => 'request_rejected', 'message' => 'The school declined this request.']);
     }
 
     public function test_operator_queues_a_main_account_password_change_for_the_signed_school_relay(): void

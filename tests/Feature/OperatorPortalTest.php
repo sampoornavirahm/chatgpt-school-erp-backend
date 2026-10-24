@@ -57,7 +57,7 @@ class OperatorPortalTest extends TestCase
         $this->actingAs($operator)->get(route('operator.schools.show', $school))->assertOk()->assertSee('Child Name')->assertSee('Parent');
     }
 
-    public function test_operator_creates_a_second_trial_tenant_and_login_scopes_duplicate_emails_by_school(): void
+    public function test_operator_creates_a_second_trial_tenant_and_parent_google_login_links_matching_school_accounts(): void
     {
         $this->postJson('/api/v1/setup/complete', ['school_name' => 'First School', 'admin_name' => 'School Admin', 'email' => 'admin@example.test', 'password' => 'a-long-test-password'])->assertCreated();
         $firstSchool = School::query()->sole();
@@ -80,19 +80,19 @@ class OperatorPortalTest extends TestCase
                 'updated_at' => now(),
             ]);
         }
-        $this->mock(GoogleIdentityVerifier::class, fn ($mock) => $mock->shouldReceive('verify')->times(3)->andReturn([
+        $this->mock(GoogleIdentityVerifier::class, fn ($mock) => $mock->shouldReceive('verify')->once()->andReturn([
             'sub' => 'same-google-parent',
             'email' => 'parent@example.test',
             'email_verified' => true,
         ]));
 
         $basePayload = ['email' => 'parent@example.test', 'phone' => '9876543210', 'role' => 'parent', 'google_id_token' => 'signed-test-token'];
-        $this->postJson('/api/v1/auth/google-login', $basePayload)
-            ->assertOk()->assertJsonPath('requiresSchoolSelection', true)->assertJsonCount(2, 'schools');
-        $firstLogin = $this->postJson('/api/v1/auth/google-login', [...$basePayload, 'school_id' => $firstSchool->id])
-            ->assertOk()->assertJsonPath('user.school.id', $firstSchool->id);
-        $secondLogin = $this->postJson('/api/v1/auth/google-login', [...$basePayload, 'school_id' => $secondSchool->id])
-            ->assertOk()->assertJsonPath('user.school.id', $secondSchool->id);
-        $this->assertNotSame($firstLogin->json('token'), $secondLogin->json('token'));
+        $login = $this->postJson('/api/v1/auth/google-login', $basePayload)
+            ->assertOk()->assertJsonMissingPath('requiresSchoolSelection');
+        $this->assertDatabaseHas('users', ['id' => $firstParent->id, 'google_subject' => 'same-google-parent']);
+        $this->assertDatabaseHas('users', ['id' => $secondParent->id, 'google_subject' => 'same-google-parent']);
+        $this->assertContains($login->json('user.id'), [$firstParent->id, $secondParent->id]);
+        $this->withToken($login->json('token'))->getJson('/api/v1/auth/me')
+            ->assertOk()->assertJsonPath('user.id', $login->json('user.id'));
     }
 }

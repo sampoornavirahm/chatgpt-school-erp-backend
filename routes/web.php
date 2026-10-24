@@ -4,6 +4,7 @@ use App\Http\Controllers\Operator\AppUpdateController as OperatorAppUpdateContro
 use App\Http\Controllers\Operator\AuthController as OperatorAuthController;
 use App\Http\Controllers\Operator\LicensePlanController as OperatorLicensePlanController;
 use App\Http\Controllers\Operator\PaymentSettingsController as OperatorPaymentSettingsController;
+use App\Http\Controllers\Operator\ParentSupportController as OperatorParentSupportController;
 use App\Http\Controllers\Operator\SchoolController as OperatorSchoolController;
 use App\Http\Controllers\Operator\SchoolLicenseController as OperatorSchoolLicenseController;
 use Illuminate\Support\Facades\Route;
@@ -26,6 +27,8 @@ Route::prefix('/operator')->name('operator.')->group(function (): void {
         Route::get('/plans', [OperatorLicensePlanController::class, 'index'])->name('plans.index');
         Route::post('/plans/{licensePlan}', [OperatorLicensePlanController::class, 'update'])->name('plans.update');
         Route::get('/payments', [OperatorPaymentSettingsController::class, 'index'])->name('payments.index');
+        Route::get('/support', [OperatorParentSupportController::class, 'index'])->name('support.index');
+        Route::post('/support/{ticket}', [OperatorParentSupportController::class, 'update'])->whereNumber('ticket')->name('support.update');
         Route::get('/app-updates', [OperatorAppUpdateController::class, 'index'])->name('app-updates.index');
         Route::post('/app-updates/{policy}', [OperatorAppUpdateController::class, 'update'])->name('app-updates.update');
         Route::post('/payments', [OperatorPaymentSettingsController::class, 'update'])->name('payments.update');

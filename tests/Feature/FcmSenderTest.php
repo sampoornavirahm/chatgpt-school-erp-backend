@@ -83,6 +83,43 @@ class FcmSenderTest extends TestCase
         $this->assertSame(0, $sent);
     }
 
+    public function test_parent_category_opt_out_filters_push_without_suppressing_teacher_alerts(): void
+    {
+        $school = School::factory()->create(['name' => 'Homework Alert School']);
+        $parent = $this->createUser($school, 'homework-parent@example.test', 'parent');
+        $teacher = $this->createUser($school, 'homework-teacher@example.test', 'teacher');
+        $this->registerDevice($parent, 'parent-homework-installation-123456');
+        $this->registerDevice($teacher, 'teacher-homework-installation-123456');
+        DB::table('parent_notification_preferences')->insert([
+            'user_id' => $parent->id,
+            'category' => 'homework_update',
+            'enabled' => false,
+            'created_at' => now(),
+            'updated_at' => now(),
+        ]);
+
+        $credentialsPath = base_path('tests/TestCase.php');
+        config([
+            'school_erp.firebase_project_id' => 'testproject1',
+            'school_erp.firebase_service_account' => $credentialsPath,
+        ]);
+        $this->mock(FcmAccessTokenProvider::class, function ($mock) use ($credentialsPath): void {
+            $mock->shouldReceive('accessToken')->once()->with(realpath($credentialsPath))->andReturn('test-access-token');
+        });
+        Http::fake([
+            'https://fcm.googleapis.com/v1/projects/testproject1/messages:send' => Http::response(['name' => 'projects/testproject1/messages/test-id'], 200),
+        ]);
+
+        $sent = app(FcmSender::class)->sendHomeworkUpdate(
+            (string) $school->id,
+            [$parent->id, $teacher->id],
+        );
+
+        $this->assertSame(1, $sent);
+        Http::assertSent(fn (Request $request): bool => $request->data()['message']['fid'] === 'teacher-homework-installation-123456');
+        Http::assertSentCount(1);
+    }
+
     private function createUser(School $school, string $email, string $role): User
     {
         return User::factory()->for($school)->state([

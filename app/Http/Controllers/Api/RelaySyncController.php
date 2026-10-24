@@ -33,6 +33,9 @@ class RelaySyncController extends Controller
             'accounts.*.is_active' => ['required', 'boolean'],
             'accounts.*.student_public_ids' => ['sometimes', 'array', 'max:100'],
             'accounts.*.student_public_ids.*' => ['required', 'uuid'],
+            'accounts.*.student_access' => ['sometimes', 'array', 'max:100'],
+            'accounts.*.student_access.*.student_public_id' => ['required', 'uuid'],
+            'accounts.*.student_access.*.access_level' => ['required', 'in:full,schedule_only'],
         ]);
         $results = [];
         DB::transaction(function () use ($data, $school, &$results): void {
@@ -77,18 +80,34 @@ class RelaySyncController extends Controller
                     $user->tokens()->delete();
                 }
                 if ($account['role'] === 'parent') {
-                    $studentIds = array_values(array_unique(array_map('strtolower', $account['student_public_ids'] ?? [])));
+                    $accessByStudent = [];
+                    foreach ($account['student_access'] ?? [] as $studentAccess) {
+                        $accessByStudent[strtolower($studentAccess['student_public_id'])] = $studentAccess['access_level'];
+                    }
+                    if (! array_key_exists('student_access', $account)) {
+                        foreach ($account['student_public_ids'] ?? [] as $studentId) {
+                            $accessByStudent[strtolower($studentId)] = 'full';
+                        }
+                    }
+                    $studentIds = array_keys($accessByStudent);
                     DB::table('relay_parent_links')->where('school_id', $school)->where('user_id', $user->id)
                         ->whereNotIn('student_public_id', $studentIds === [] ? ['00000000-0000-0000-0000-000000000000'] : $studentIds)
                         ->delete();
-                    foreach ($studentIds as $studentId) {
-                        DB::table('relay_parent_links')->insertOrIgnore([
+                    if ($studentIds !== []) {
+                        $now = now();
+                        $links = array_map(static fn (string $studentId): array => [
                             'school_id' => $school,
                             'user_id' => $user->id,
                             'student_public_id' => $studentId,
-                            'created_at' => now(),
-                            'updated_at' => now(),
-                        ]);
+                            'access_level' => $accessByStudent[$studentId],
+                            'created_at' => $now,
+                            'updated_at' => $now,
+                        ], $studentIds);
+                        DB::table('relay_parent_links')->upsert(
+                            $links,
+                            ['school_id', 'user_id', 'student_public_id'],
+                            ['access_level', 'updated_at'],
+                        );
                     }
                 }
                 $results[] = ['relayUserId' => (int) $account['relay_user_id'], 'status' => 'accepted'];
@@ -168,6 +187,95 @@ class RelaySyncController extends Controller
         return response()->json(['updated' => 1]);
     }
 
+    public function pushCalendar(Request $request, string $school, LicenseTokenService $tokens, FcmSender $notifications): JsonResponse
+    {
+        $data = $request->validate([
+            'revision' => ['required', 'integer', 'min:1'],
+            'content_hash' => ['required', 'regex:/^[a-f0-9]{64}$/'],
+            'events' => ['required', 'array', 'max:300'],
+            'events.*.id' => ['required', 'integer', 'min:1'],
+            'events.*.title' => ['required', 'string', 'max:160'],
+            'events.*.eventType' => ['required', 'in:holiday,closure,exam,trip,deadline,event,ptm,other'],
+            'events.*.startDate' => ['required', 'date_format:Y-m-d'],
+            'events.*.endDate' => ['nullable', 'date_format:Y-m-d'],
+            'events.*.notes' => ['nullable', 'string', 'max:2000'],
+        ]);
+        foreach ($data['events'] as $index => $event) {
+            if (($event['endDate'] ?? null) !== null && $event['endDate'] < $event['startDate']) {
+                throw ValidationException::withMessages(["events.$index.endDate" => ['The event end date must be on or after its start date.']]);
+            }
+        }
+        $events = array_values($data['events']);
+        $payload = json_encode($events, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+        if (! hash_equals($data['content_hash'], hash('sha256', $payload)) || strlen($payload) > self::MAX_SNAPSHOT_BYTES) {
+            throw ValidationException::withMessages(['content_hash' => ['The calendar integrity hash or payload size is invalid.']]);
+        }
+
+        $result = DB::transaction(function () use ($data, $school, $tokens, $payload): array {
+            $schoolRow = DB::table('schools')->where('id', $school)->lockForUpdate()->first();
+            if ($schoolRow === null) {
+                return ['missing' => true];
+            }
+            if ($schoolRow->current_license_id !== null) {
+                $currentLicense = DB::table('school_licenses')->where('id', $schoolRow->current_license_id)->first();
+                $verification = $currentLicense === null ? ['valid' => false] : $tokens->verify($currentLicense->signed_token);
+                $isRevoked = $schoolRow->license_status === 'suspended' || $currentLicense?->status === 'revoked';
+                $isExpired = $currentLicense === null || ! ($verification['valid'] ?? false) || ($verification['state'] ?? null) === 'expired';
+                if ($isRevoked || $isExpired) {
+                    return ['blocked' => $isRevoked ? 'LICENSE_REVOKED_READ_ONLY' : 'LICENSE_EXPIRED_READ_ONLY'];
+                }
+            }
+
+            $current = DB::table('relay_school_calendars')->where('school_id', $school)->lockForUpdate()->first();
+            $revision = (int) $data['revision'];
+            if ($current !== null && $revision < (int) $current->revision) {
+                return ['status' => 'stale', 'revision' => (int) $current->revision];
+            }
+            if ($current !== null && $revision === (int) $current->revision) {
+                if (hash_equals($current->content_hash, $data['content_hash'])) {
+                    return ['status' => 'unchanged', 'revision' => $revision];
+                }
+
+                return ['conflict' => true, 'revision' => (int) $current->revision];
+            }
+
+            DB::table('relay_school_calendars')->updateOrInsert(
+                ['school_id' => $school],
+                [
+                    'revision' => $revision,
+                    'content_hash' => $data['content_hash'],
+                    'payload' => $payload,
+                    'projected_at' => now(),
+                ],
+            );
+            $userIds = $current === null
+                ? []
+                : DB::table('users')->where('school_id', $school)->where('is_active', true)
+                    ->whereIn('role', ['parent', 'teacher'])->orderBy('id')->pluck('id')
+                    ->map(static fn ($id): int => (int) $id)->all();
+
+            return ['status' => 'accepted', 'revision' => $revision, 'changed' => $current !== null, 'userIds' => $userIds];
+        }, 3);
+
+        if ($result['missing'] ?? false) {
+            return response()->json(['error' => ['code' => 'SCHOOL_NOT_FOUND']], 404);
+        }
+        if (isset($result['blocked'])) {
+            return response()->json(['error' => ['code' => $result['blocked']]], 403);
+        }
+        if ($result['conflict'] ?? false) {
+            return response()->json(['error' => ['code' => 'CALENDAR_REVISION_CONFLICT']], 409);
+        }
+        if (($result['status'] ?? null) === 'stale') {
+            return response()->json(['status' => 'stale', 'revision' => $result['revision']], 409);
+        }
+        if (($result['changed'] ?? false) && ($result['userIds'] ?? []) !== []) {
+            defer(fn () => $notifications->sendScheduleUpdate($school, $result['userIds']));
+        }
+
+        return response()->json(['status' => $result['status'], 'revision' => $result['revision']]);
+    }
+
     public function push(Request $request, string $school, LicenseTokenService $tokens, FcmSender $notifications): JsonResponse
     {
         $data = $request->validate([
@@ -194,6 +302,8 @@ class RelaySyncController extends Controller
         $now = now();
         $result = DB::transaction(function () use ($data, $school, $requestHash, $now, $tokens): array {
             $newNoticeStudentIds = [];
+            $changedScheduleStudentIds = [];
+            $newHomeworkStudentIds = [];
             $schoolRow = DB::table('schools')->where('id', $school)->lockForUpdate()->first();
             $existingBatch = DB::table('relay_batches')->where('school_id', $school)->where('batch_id', $data['batch_id'])->first();
             if ($existingBatch !== null) {
@@ -201,7 +311,7 @@ class RelaySyncController extends Controller
                     return ['conflict' => true];
                 }
 
-                return ['replayed' => true, 'response' => json_decode($existingBatch->response_json, true, flags: JSON_THROW_ON_ERROR), 'noticeUserIds' => []];
+                return ['replayed' => true, 'response' => json_decode($existingBatch->response_json, true, flags: JSON_THROW_ON_ERROR), 'noticeUserIds' => [], 'scheduleUserIds' => [], 'homeworkUserIds' => []];
             }
 
             $responses = [];
@@ -267,6 +377,14 @@ class RelaySyncController extends Controller
                     if (array_diff($nextNoticeIds, $priorNoticeIds) !== []) {
                         $newNoticeStudentIds[$studentId] = $studentId;
                     }
+                    if (($priorSnapshot['timetable'] ?? []) !== ($record['snapshot']['timetable'] ?? [])) {
+                        $changedScheduleStudentIds[$studentId] = $studentId;
+                    }
+                    $priorHomeworkIds = $this->publishedHomeworkIds($priorSnapshot['homework'] ?? []);
+                    $nextHomeworkIds = $this->publishedHomeworkIds($record['snapshot']['homework'] ?? []);
+                    if (array_diff($nextHomeworkIds, $priorHomeworkIds) !== []) {
+                        $newHomeworkStudentIds[$studentId] = $studentId;
+                    }
                 }
                 DB::table('relay_snapshots')->updateOrInsert(
                     ['school_id' => $school, 'student_public_id' => $studentId],
@@ -299,6 +417,30 @@ class RelaySyncController extends Controller
                     ->pluck('user_id')
                     ->map(static fn ($userId): int => (int) $userId)
                     ->all();
+            $scheduleUserIds = $changedScheduleStudentIds === []
+                ? []
+                : DB::table('relay_parent_links')
+                    ->where('school_id', $school)
+                    ->whereIn('student_public_id', array_values($changedScheduleStudentIds))
+                    ->distinct()
+                    ->orderBy('user_id')
+                    ->pluck('user_id')
+                    ->map(static fn ($userId): int => (int) $userId)
+                    ->all();
+            $homeworkUserIds = $newHomeworkStudentIds === []
+                ? []
+                : DB::table('relay_parent_links')
+                    ->join('users', 'users.id', '=', 'relay_parent_links.user_id')
+                    ->where('relay_parent_links.school_id', $school)
+                    ->whereIn('relay_parent_links.student_public_id', array_values($newHomeworkStudentIds))
+                    ->where('users.school_id', $school)
+                    ->where('users.role', 'parent')
+                    ->where('users.is_active', true)
+                    ->distinct()
+                    ->orderBy('relay_parent_links.user_id')
+                    ->pluck('relay_parent_links.user_id')
+                    ->map(static fn ($userId): int => (int) $userId)
+                    ->all();
             DB::table('relay_batches')->insert([
                 'school_id' => $school,
                 'batch_id' => $data['batch_id'],
@@ -307,7 +449,7 @@ class RelaySyncController extends Controller
                 'created_at' => $now,
             ]);
 
-            return ['replayed' => false, 'response' => $response, 'noticeUserIds' => $noticeUserIds];
+            return ['replayed' => false, 'response' => $response, 'noticeUserIds' => $noticeUserIds, 'scheduleUserIds' => $scheduleUserIds, 'homeworkUserIds' => $homeworkUserIds];
         }, 3);
 
         if (isset($result['blocked'])) {
@@ -319,6 +461,12 @@ class RelaySyncController extends Controller
 
         if (($result['noticeUserIds'] ?? []) !== []) {
             defer(fn () => $notifications->sendSchoolNotice($school, $result['noticeUserIds']));
+        }
+        if (($result['scheduleUserIds'] ?? []) !== []) {
+            defer(fn () => $notifications->sendScheduleUpdate($school, $result['scheduleUserIds']));
+        }
+        if (($result['homeworkUserIds'] ?? []) !== []) {
+            defer(fn () => $notifications->sendHomeworkUpdate($school, $result['homeworkUserIds']));
         }
 
         return response()->json($result['response'])->header('Idempotency-Replayed', ($result['replayed'] ?? false) ? 'true' : 'false');
@@ -338,6 +486,27 @@ class RelaySyncController extends Controller
             }
             $id = (string) $announcement['id'];
             if ($id !== '') {
+                $ids[$id] = $id;
+            }
+        }
+
+        return array_values($ids);
+    }
+
+    /** @return list<string> */
+    private function publishedHomeworkIds(mixed $homework): array
+    {
+        if (! is_array($homework)) {
+            return [];
+        }
+
+        $ids = [];
+        foreach ($homework as $assignment) {
+            if (! is_array($assignment) || (! is_string($assignment['id'] ?? null) && ! is_int($assignment['id'] ?? null))) {
+                continue;
+            }
+            $id = (string) $assignment['id'];
+            if (preg_match('/^[1-9][0-9]*$/', $id) === 1) {
                 $ids[$id] = $id;
             }
         }
@@ -374,21 +543,57 @@ class RelaySyncController extends Controller
         $data = $request->validate([
             'results' => ['required', 'array', 'min:1', 'max:100'],
             'results.*.operation_id' => ['required', 'uuid'],
-            'results.*.status' => ['required', 'in:accepted,rejected'],
+            'results.*.status' => ['required', 'in:accepted,rejected,request_approved,request_rejected,needs_info'],
             'results.*.message' => ['sometimes', 'string', 'max:240'],
         ]);
         $updated = 0;
-        DB::transaction(function () use ($data, $school, &$updated): void {
+        DB::transaction(function () use ($data, $school, $request, &$updated): void {
             foreach ($data['results'] as $result) {
-                $updated += DB::table('relay_parent_commands')
+                $operationId = strtolower($result['operation_id']);
+                $command = DB::table('relay_parent_commands')
                     ->where('school_id', $school)
-                    ->where('operation_id', strtolower($result['operation_id']))
-                    ->whereIn('status', ['queued', 'delivered'])
+                    ->where('operation_id', $operationId)
+                    ->whereIn('status', ['queued', 'delivered', 'accepted'])
+                    ->lockForUpdate()
+                    ->first(['status', 'result_message']);
+                if ($command === null) {
+                    continue;
+                }
+
+                $message = $result['message'] ?? '';
+                if ($command->status === $result['status'] && $command->result_message === $message) {
+                    continue;
+                }
+
+                $completedAt = now();
+                $changed = DB::table('relay_parent_commands')
+                    ->where('school_id', $school)
+                    ->where('operation_id', $operationId)
+                    ->whereIn('status', ['queued', 'delivered', 'accepted'])
                     ->update([
                         'status' => $result['status'],
-                        'result_message' => $result['message'] ?? '',
-                        'completed_at' => now(),
+                        'result_message' => $message,
+                        'completed_at' => $completedAt,
                     ]);
+                $updated += $changed;
+
+                if ($changed === 1) {
+                    DB::table('relay_audit_logs')->insert([
+                        'school_id' => $school,
+                        'actor_user_id' => null,
+                        'action' => 'parent_request_status_received',
+                        'target_type' => 'parent_command',
+                        'target_id' => $operationId,
+                        'details' => json_encode([
+                            'from' => $command->status,
+                            'to' => $result['status'],
+                            'messageProvided' => $message !== '',
+                            'source' => 'signed_school_hub_relay',
+                        ], JSON_THROW_ON_ERROR),
+                        'ip_address' => $request->ip(),
+                        'created_at' => $completedAt,
+                    ]);
+                }
             }
         });
 

@@ -14,7 +14,19 @@ class EnsureSchoolAccess
     public function handle(Request $request, Closure $next): Response
     {
         $user = $request->user();
-        $school = $user?->school;
+        if ($user === null) {
+            return response()->json([
+                'error' => ['code' => 'AUTH_REQUIRED', 'message' => 'Sign in to continue.'],
+            ], 401);
+        }
+
+        if (! $user->is_active) {
+            return response()->json([
+                'error' => ['code' => 'ACCOUNT_DISABLED', 'message' => 'This account is disabled. Contact your school administrator.'],
+            ], 401);
+        }
+
+        $school = $user->school;
         $trialEnabled = (bool) config('school_erp.trial_enabled');
         $googleStates = $trialEnabled ? ['verified', 'bypassed_trial'] : ['verified'];
         $activationStates = $trialEnabled ? ['active', 'bypassed_trial'] : ['active'];
@@ -34,11 +46,16 @@ class EnsureSchoolAccess
             $allowedWhileHeld = $request->routeIs(
                 'auth.me',
                 'auth.logout',
+                'auth.sessions.index',
+                'auth.sessions.destroy',
+                'auth.sessions.destroy-all',
                 'licensing.status',
                 'licensing.trial-extension-requests.store',
                 'billing.orders.index',
                 'billing.orders.store',
                 'billing.orders.simulate',
+                'parent.support-tickets.index',
+                'parent.support-tickets.store',
             );
             if (! $allowedWhileHeld) {
                 return response()->json([
@@ -57,8 +74,10 @@ class EnsureSchoolAccess
             $expired = ! ($verification['valid'] ?? false) || ($verification['state'] ?? null) === 'expired';
             $canRenew = $request->routeIs(
                 'auth.me', 'auth.logout', 'licensing.status',
+                'auth.sessions.index', 'auth.sessions.destroy', 'auth.sessions.destroy-all',
                 'billing.orders.index', 'billing.orders.store', 'billing.orders.simulate',
                 'licensing.trial-extension-requests.store',
+                'parent.support-tickets.index', 'parent.support-tickets.store',
             );
             if (! $request->isMethodSafe() && ! $canRenew && ($revoked || $expired)) {
                 $code = $revoked ? 'LICENSE_REVOKED_READ_ONLY' : 'LICENSE_EXPIRED_READ_ONLY';

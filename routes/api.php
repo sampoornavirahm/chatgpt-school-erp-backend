@@ -8,6 +8,7 @@ use App\Http\Controllers\Api\LicensingController;
 use App\Http\Controllers\Api\MobileDeviceController;
 use App\Http\Controllers\Api\NotificationTestController;
 use App\Http\Controllers\Api\ParentRelayController;
+use App\Http\Controllers\Api\ParentSupportTicketController;
 use App\Http\Controllers\Api\RelaySyncController;
 use App\Http\Controllers\Api\SchoolPaymentSettingsController;
 use App\Http\Controllers\Api\SetupController;
@@ -60,10 +61,15 @@ Route::post('/webhooks/{provider}', [WebhookReceiptController::class, 'store'])
     ->middleware('throttle:60,1')
     ->name('webhooks.receipts.store');
 
+Route::post('/parent/support-tickets/public-login', [ParentSupportTicketController::class, 'storePublicLoginRequest'])
+    ->middleware('throttle:3,60')
+    ->name('parent.support-tickets.public-login');
+
 Route::prefix('/relay/schools/{school}')
     ->middleware(['relay.signature', 'throttle:120,1'])
     ->group(function (): void {
         Route::post('/sync/push', [RelaySyncController::class, 'push'])->name('relay.sync.push');
+        Route::post('/calendar', [RelaySyncController::class, 'pushCalendar'])->name('relay.calendar.push');
         Route::get('/sync/pull', [RelaySyncController::class, 'pull'])->name('relay.sync.pull');
         Route::post('/sync/ack', [RelaySyncController::class, 'acknowledge'])->name('relay.sync.ack');
         Route::post('/accounts/sync', [RelaySyncController::class, 'syncAccounts'])->name('relay.accounts.sync');
@@ -73,6 +79,9 @@ Route::prefix('/relay/schools/{school}')
 
 Route::middleware(['auth.reset', 'auth:sanctum', 'school.access'])->group(function (): void {
     Route::get('/auth/me', [AuthController::class, 'me'])->name('auth.me');
+    Route::get('/auth/sessions', [AuthController::class, 'sessions'])->middleware('throttle:30,1')->name('auth.sessions.index');
+    Route::delete('/auth/sessions/{session}', [AuthController::class, 'revokeSession'])->middleware('throttle:30,1')->name('auth.sessions.destroy');
+    Route::delete('/auth/sessions', [AuthController::class, 'logoutAll'])->middleware('throttle:10,1')->name('auth.sessions.destroy-all');
     Route::post('/auth/logout', [AuthController::class, 'logout'])->name('auth.logout');
     Route::get('/licensing/status', [LicensingController::class, 'status'])->name('licensing.status');
     Route::get('/school/payment-settings', [SchoolPaymentSettingsController::class, 'show'])->name('school.payment-settings.show');
@@ -87,6 +96,10 @@ Route::middleware(['auth.reset', 'auth:sanctum', 'school.access'])->group(functi
     Route::delete('/devices/fcm-token', [MobileDeviceController::class, 'destroy'])->name('devices.destroy');
     Route::get('/parent/children', [ParentRelayController::class, 'children'])->middleware('throttle:60,1')->name('parent.children');
     Route::get('/parent/children/{student}', [ParentRelayController::class, 'showChild'])->middleware('throttle:60,1')->name('parent.children.show');
+    Route::get('/parent/notification-preferences', [ParentRelayController::class, 'notificationPreferences'])->middleware('throttle:60,1')->name('parent.notification-preferences.show');
+    Route::post('/parent/notification-preferences', [ParentRelayController::class, 'updateNotificationPreference'])->middleware('throttle:30,1')->name('parent.notification-preferences.update');
     Route::get('/parent/commands', [ParentRelayController::class, 'commands'])->middleware('throttle:60,1')->name('parent.commands');
     Route::post('/parent/commands', [ParentRelayController::class, 'submit'])->middleware('throttle:30,1')->name('parent.commands.store');
+    Route::get('/parent/support-tickets', [ParentSupportTicketController::class, 'index'])->middleware('throttle:30,1')->name('parent.support-tickets.index');
+    Route::post('/parent/support-tickets', [ParentSupportTicketController::class, 'store'])->middleware('throttle:5,1')->name('parent.support-tickets.store');
 });

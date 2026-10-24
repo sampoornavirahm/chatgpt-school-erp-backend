@@ -61,6 +61,25 @@ class AuthControllerTest extends TestCase
         $this->withToken($login->json('token'))->getJson('/api/v1/auth/me')->assertUnauthorized();
     }
 
+    public function test_disabling_a_mobile_account_invalidates_its_existing_token(): void
+    {
+        $school = $this->createTrialSchool();
+        $parent = User::factory()->for($school)->state([
+            'name' => 'Parent Account',
+            'email' => 'parent@example.test',
+            'phone' => '9876543210',
+            'password' => 'parent-password-long',
+            'role' => 'parent',
+            'is_active' => true,
+        ])->create();
+        $token = $parent->createToken('parent-device', ['parent'])->plainTextToken;
+        $parent->forceFill(['is_active' => false])->save();
+
+        $this->withToken($token)->getJson('/api/v1/auth/me')
+            ->assertUnauthorized()
+            ->assertJsonPath('error.code', 'ACCOUNT_DISABLED');
+    }
+
     public function test_disabling_trial_blocks_bypassed_school_setup_with_403(): void
     {
         $setup = $this->postJson('/api/v1/setup/complete', [
