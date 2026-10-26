@@ -3,6 +3,7 @@ name: Backend CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -59,3 +60,151 @@ jobs:
       - uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  deploy-uat:
+    name: Deploy UAT to Hostinger
+    needs: mysql-integration
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && vars.HOSTINGER_SSH_HOST != ''
+    runs-on: ubuntu-latest
+    environment: uat
+    concurrency:
+      group: hostinger-backend-uat
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up PHP for production dependencies
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.5'
+          extensions: mbstring, pdo_mysql, sodium, curl, fileinfo, dom
+          tools: composer:v2
+          coverage: none
+
+      - name: Set up Node for Vite assets
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Prepare Laravel writable directories
+        run: |
+          mkdir -p bootstrap/cache storage/framework/cache storage/framework/views storage/framework/sessions storage/framework/testing storage/app/private
+          chmod -R u+rwX bootstrap/cache storage
+
+      - name: Install production Composer dependencies
+        run: composer install --no-dev --no-interaction --prefer-dist --no-progress --optimize-autoloader
+
+      - name: Build portal assets
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package application
+        run: |
+          tar -czf "$RUNNER_TEMP/school-erp-backend-${GITHUB_SHA}.tar.gz" \
+            --exclude='./.git' \
+            --exclude='./.github' \
+            --exclude='./.env' \
+            --exclude='./.env.*' \
+            --exclude='./node_modules' \
+            --exclude='./tests' \
+            --exclude='./docs' \
+            --exclude='./storage' \
+            --exclude='./bootstrap/cache' \
+            --exclude='./.phpunit.result.cache' \
+            -C "$GITHUB_WORKSPACE" .
+
+      - name: Verify Hostinger deployment settings
+        env:
+          HOSTINGER_SSH_HOST: ${{ vars.HOSTINGER_SSH_HOST }}
+          HOSTINGER_SSH_USER: ${{ vars.HOSTINGER_SSH_USER }}
+          HOSTINGER_SSH_PRIVATE_KEY: ${{ secrets.HOSTINGER_SSH_PRIVATE_KEY }}
+          HOSTINGER_KNOWN_HOSTS: ${{ vars.HOSTINGER_KNOWN_HOSTS }}
+          HOSTINGER_APP_PATH: ${{ vars.HOSTINGER_APP_PATH }}
+          HOSTINGER_PUBLIC_PATH: ${{ vars.HOSTINGER_PUBLIC_PATH }}
+          HOSTINGER_PHP_BIN: ${{ vars.HOSTINGER_PHP_BIN }}
+          HOSTINGER_HEALTH_URL: ${{ vars.HOSTINGER_HEALTH_URL }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in HOSTINGER_SSH_HOST HOSTINGER_SSH_USER HOSTINGER_SSH_PRIVATE_KEY HOSTINGER_KNOWN_HOSTS HOSTINGER_APP_PATH HOSTINGER_PUBLIC_PATH HOSTINGER_PHP_BIN HOSTINGER_HEALTH_URL; do
+            if [ -z "${!name:-}" ]; then missing+=("$name"); fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing uat deployment settings: %s\n' "${missing[*]}" >&2
+            exit 1
+          fi
+
+      - name: Configure SSH and upload release package
+        env:
+          HOSTINGER_SSH_HOST: ${{ vars.HOSTINGER_SSH_HOST }}
+          HOSTINGER_SSH_PORT: ${{ vars.HOSTINGER_SSH_PORT }}
+          HOSTINGER_SSH_USER: ${{ vars.HOSTINGER_SSH_USER }}
+          HOSTINGER_SSH_PRIVATE_KEY: ${{ secrets.HOSTINGER_SSH_PRIVATE_KEY }}
+          HOSTINGER_KNOWN_HOSTS: ${{ vars.HOSTINGER_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          printf '%s\n' "$HOSTINGER_SSH_PRIVATE_KEY" > "$HOME/.ssh/hostinger_deploy_key"
+          chmod 600 "$HOME/.ssh/hostinger_deploy_key"
+          printf '%s\n' "$HOSTINGER_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 600 "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/hostinger_deploy_key" >/dev/null
+
+          port="${HOSTINGER_SSH_PORT:-22}"
+          target="$HOSTINGER_SSH_USER@$HOSTINGER_SSH_HOST"
+          package="$RUNNER_TEMP/school-erp-backend-${GITHUB_SHA}.tar.gz"
+          remote_package="/tmp/school-erp-backend-${GITHUB_SHA}.tar.gz"
+          scp -i "$HOME/.ssh/hostinger_deploy_key" -P "$port" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$package" "$target:$remote_package"
+
+      - name: Deploy, migrate and warm Laravel caches
+        env:
+          HOSTINGER_SSH_HOST: ${{ vars.HOSTINGER_SSH_HOST }}
+          HOSTINGER_SSH_PORT: ${{ vars.HOSTINGER_SSH_PORT }}
+          HOSTINGER_SSH_USER: ${{ vars.HOSTINGER_SSH_USER }}
+          HOSTINGER_SSH_PRIVATE_KEY: ${{ secrets.HOSTINGER_SSH_PRIVATE_KEY }}
+          HOSTINGER_APP_PATH: ${{ vars.HOSTINGER_APP_PATH }}
+          HOSTINGER_PUBLIC_PATH: ${{ vars.HOSTINGER_PUBLIC_PATH }}
+          HOSTINGER_PHP_BIN: ${{ vars.HOSTINGER_PHP_BIN }}
+        run: |
+          set -euo pipefail
+          port="${HOSTINGER_SSH_PORT:-22}"
+          target="$HOSTINGER_SSH_USER@$HOSTINGER_SSH_HOST"
+          remote_package="/tmp/school-erp-backend-${GITHUB_SHA}.tar.gz"
+          ssh -i "$HOME/.ssh/hostinger_deploy_key" -p "$port" \
+            -o BatchMode=yes -o StrictHostKeyChecking=yes "$target" \
+            bash -s -- "$HOSTINGER_APP_PATH" "$HOSTINGER_PUBLIC_PATH" "$HOSTINGER_PHP_BIN" "$remote_package" <<'REMOTE'
+          set -euo pipefail
+          app_path="$1"
+          public_path="$2"
+          php_bin="$3"
+          package="$4"
+
+          test -f "$app_path/.env" || { echo 'Laravel .env is missing; refusing deployment.' >&2; exit 1; }
+          test -x "$php_bin" || { echo 'Configured PHP CLI binary is not executable.' >&2; exit 1; }
+          mkdir -p "$app_path" "$app_path/bootstrap/cache" \
+            "$app_path/storage/framework/cache" "$app_path/storage/framework/views" \
+            "$app_path/storage/framework/sessions" "$app_path/storage/framework/testing" \
+            "$app_path/storage/app/private" "$public_path/build"
+
+          tar -xzf "$package" --no-same-owner -C "$app_path"
+          rm -f "$package"
+          cd "$app_path"
+          chmod -R u+rwX bootstrap/cache storage
+          "$php_bin" artisan config:clear
+          "$php_bin" artisan route:clear
+          "$php_bin" artisan event:clear
+          "$php_bin" artisan view:clear
+          "$php_bin" artisan migrate --force
+          "$php_bin" artisan optimize
+          cp -a public/build/. "$public_path/build/"
+          REMOTE
+
+      - name: Check deployed UAT health endpoint
+        env:
+          HOSTINGER_HEALTH_URL: ${{ vars.HOSTINGER_HEALTH_URL }}
+        run: curl --fail --silent --show-error --retry 5 --retry-all-errors --retry-delay 3 "$HOSTINGER_HEALTH_URL"
