@@ -71,7 +71,11 @@ class AuthController extends Controller
     {
         $data = $request->validate([
             'email' => ['required', 'email:rfc', 'max:255'],
-            'phone' => ['required', 'string', 'regex:/^\\+?[0-9][0-9 .()-]{7,20}$/'],
+            'phone' => [
+                $request->input('role') === 'teacher' ? 'required' : 'nullable',
+                'string',
+                'regex:/^\\+?[0-9][0-9 .()-]{7,20}$/',
+            ],
             'role' => ['required', 'in:parent,teacher'],
             'google_id_token' => ['required', 'string', 'max:8192'],
             'school_id' => ['nullable', 'uuid'],
@@ -88,9 +92,12 @@ class AuthController extends Controller
             throw ValidationException::withMessages(['google_id_token' => ['Choose the same Google account as the registered Gmail address.']]);
         }
 
-        $phone = preg_replace('/\\D+/', '', $data['phone']);
-        $query = User::query()->with('school')->where('email', $email)->where('phone', $phone)
+        $phone = preg_replace('/\\D+/', '', $data['phone'] ?? '');
+        $query = User::query()->with('school')->where('email', $email)
             ->where('role', $data['role'])->where('is_active', true)->orderBy('school_id');
+        if ($data['role'] === 'teacher' || ! empty($phone)) {
+            $query->where('phone', $phone);
+        }
         if (! empty($data['school_id'])) {
             $query->where('school_id', $data['school_id']);
         }
